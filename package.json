@@ -1,24 +1,11 @@
 {
   "name": "yeastar-n8n-bridge",
-  "version": "3.1.0",
-  "description": "Enhanced bridge server between Yeastar PBX, OpenAI Whisper, and n8n with comprehensive error handling, retry logic, and audio validation",
-  "main": "server-improved.js",
+  "version": "1.0.0",
+  "description": "Bridge server between Yeastar PBX and n8n for automated call recording processing and transcription",
+  "main": "server.js",
   "scripts": {
-    "start": "node server-improved.js",
-    "start:old": "node server.js",
-    "dev": "nodemon server-improved.js",
-    "test": "node test-endpoints.js",
-    "test:health": "curl -s http://localhost:3000/health | json_pp || curl -s http://localhost:3000/health",
-    "test:server": "curl -s http://localhost:3000/",
-    "validate-config": "node -e \"require('dotenv').config(); console.log('✅ Config validated successfully')\"",
-    "refresh-token": "curl -X POST http://localhost:3000/admin/refresh-token",
-    "docker:build": "docker build -t yeastar-bridge:3.1 .",
-    "docker:run": "docker run -d --name yeastar-bridge --env-file .env -p 3000:3000 yeastar-bridge:3.1",
-    "docker:stop": "docker stop yeastar-bridge && docker rm yeastar-bridge",
-    "docker:logs": "docker logs -f yeastar-bridge",
-    "docker:compose:up": "docker-compose up -d",
-    "docker:compose:down": "docker-compose down",
-    "docker:compose:logs": "docker-compose logs -f"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "keywords": [
     "yeastar",
@@ -27,35 +14,20 @@
     "call-recording",
     "transcription",
     "webhook",
-    "bridge",
-    "openai",
-    "whisper",
-    "speech-to-text",
-    "automation",
-    "retry-logic",
-    "error-handling"
+    "bridge"
   ],
   "author": "Engosoft",
   "license": "MIT",
   "dependencies": {
-    "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
     "form-data": "^4.0.0",
-    "node-fetch": "^2.7.0"
+    "dotenv": "^16.3.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
   },
   "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=8.0.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/engosoft/yeastar-n8n-bridge.git"
-  },
-  "bugs": {
-    "url": "https://github.com/engosoft/yeastar-n8n-bridge/issues"
-  },
-  "homepage": "https://github.com/engosoft/yeastar-n8n-bridge#readme"
-}
+    "node": ">=18.0.0"
+  }
+} 
