@@ -40,7 +40,7 @@ function log(level, message, data = null) {
   }
 }
 
-// Token refresh function (optional - for production use)
+// Token refresh function
 async function refreshYeastarToken() {
   if (!CONFIG.TOKEN_REFRESH_ENABLED) return;
   
@@ -120,13 +120,15 @@ app.post('/yeastar-webhook', async (req, res) => {
     
     // Download recording from Yeastar
     log('info', `📥 Downloading recording for call: ${callData.call_id}`);
+    log('debug', `Recording filename: ${callData.recording_filename}`);
+    
     const audioBuffer = await downloadRecording(callData);
-    log('success', `Audio downloaded: ${audioBuffer.length} bytes`);
+    log('success', `✅ Audio downloaded: ${audioBuffer.length} bytes`);
     
     // Send to n8n
     log('info', `📤 Sending to n8n: ${CONFIG.N8N_WEBHOOK_URL}`);
     const n8nResult = await sendToN8n(audioBuffer, callData);
-    log('success', 'Successfully sent to n8n', n8nResult);
+    log('success', '✅ Successfully sent to n8n', n8nResult);
     
     const processingTime = Date.now() - startTime;
     
@@ -168,17 +170,22 @@ app.post('/manual-trigger', async (req, res) => {
   try {
     log('info', '🔧 Manual trigger called');
     
-    // You can use this endpoint to manually upload audio files for testing
-    const { recording_url, call_id } = req.body;
+    const { recording_filename, call_id } = req.body;
     
-    if (!recording_url) {
-      return res.status(400).json({ error: 'recording_url is required' });
+    if (!recording_filename) {
+      return res.status(400).json({ error: 'recording_filename is required' });
     }
     
     const callData = {
       call_id: call_id || 'manual_test',
-      recording_url: recording_url,
-      hasRecording: true
+      recording_filename: recording_filename,
+      hasRecording: true,
+      caller_number: 'manual_test',
+      callee_number: 'manual_test',
+      duration: '0',
+      start_time: new Date().toISOString(),
+      end_time: new Date().toISOString(),
+      status: 'ANSWERED'
     };
     
     const audioBuffer = await downloadRecording(callData);
@@ -202,8 +209,11 @@ app.post('/manual-trigger', async (req, res) => {
 // ============================================================================
 
 function extractCallData(webhookPayload) {
-  // Yeastar webhook payload structure varies by event type
-  // Adjust these fields based on your actual webhook data
+  // Yeastar sends the recording filename in the "recording" field
+  const recordingFilename = webhookPayload.recording || 
+                           webhookPayload.recordingfile || 
+                           webhookPayload.recording_file || 
+                           null;
   
   return {
     call_id: webhookPayload.call_id || 
@@ -211,29 +221,28 @@ function extractCallData(webhookPayload) {
              webhookPayload.uniqueid || 
              'unknown',
     
-    recording_url: webhookPayload.recording_url || 
-                   webhookPayload.recordingfile || 
-                   null,
+    recording_filename: recordingFilename,
     
-    recording_id: webhookPayload.recording_id || 
-                  webhookPayload.recordingid || 
-                  null,
-    
-    duration: webhookPayload.duration || 
+    duration: webhookPayload.talk_duration || 
+              webhookPayload.call_duration ||
+              webhookPayload.duration || 
               webhookPayload.billsec || 
               '0',
     
-    caller_number: webhookPayload.caller_number || 
+    caller_number: webhookPayload.call_from || 
+                   webhookPayload.caller_number || 
                    webhookPayload.src || 
                    webhookPayload.from || 
                    '',
     
-    callee_number: webhookPayload.callee_number || 
+    callee_number: webhookPayload.call_to ||
+                   webhookPayload.callee_number || 
                    webhookPayload.dst || 
                    webhookPayload.to || 
                    '',
     
-    start_time: webhookPayload.start_time || 
+    start_time: webhookPayload.time_start ||
+                webhookPayload.start_time || 
                 webhookPayload.calldate || 
                 new Date().toISOString(),
     
@@ -244,31 +253,37 @@ function extractCallData(webhookPayload) {
             webhookPayload.disposition || 
             'ANSWERED',
     
-    hasRecording: !!(webhookPayload.recording_url || webhookPayload.recording_id)
+    type: webhookPayload.type || 'Unknown',
+    
+    hasRecording: !!recordingFilename && recordingFilename !== ''
   };
 }
 
 async function downloadRecording(callData) {
-  let audioResponse;
+  if (!callData.recording_filename) {
+    throw new Error('No recording filename available');
+  }
   
-  // Method 1: Direct URL (if provided by Yeastar)
-  if (callData.recording_url) {
-    log('debug', 'Using direct recording URL');
-    audioResponse = await fetch(callData.recording_url);
+  if (!CONFIG.YEASTAR_API_TOKEN) {
+    throw new Error('Yeastar API token not configured');
   }
-  // Method 2: Via Yeastar API
-  else if (callData.recording_id && CONFIG.YEASTAR_API_TOKEN) {
-    log('debug', 'Using Yeastar API to download recording');
-    
-    const apiUrl = `${CONFIG.YEASTAR_BASE_URL}/openapi/v1.0/recording/download?recording_id=${callData.recording_id}&access_token=${CONFIG.YEASTAR_API_TOKEN}`;
-    audioResponse = await fetch(apiUrl);
-  }
-  else {
-    throw new Error('No recording URL or recording ID available');
-  }
+  
+  // Yeastar API endpoint for downloading recordings
+  // Format: /openapi/v1.0/recording/download?filename=xxx.wav&access_token=xxx
+  const apiUrl = `${CONFIG.YEASTAR_BASE_URL}/openapi/v1.0/recording/download?filename=${encodeURIComponent(callData.recording_filename)}&access_token=${CONFIG.YEASTAR_API_TOKEN}`;
+  
+  log('debug', `Downloading from: ${apiUrl.replace(CONFIG.YEASTAR_API_TOKEN, '***TOKEN***')}`);
+  
+  const audioResponse = await fetch(apiUrl, {
+    method: 'GET',
+    headers: {
+      'User-Agent': 'OpenAPI'
+    }
+  });
   
   if (!audioResponse.ok) {
-    throw new Error(`Failed to download recording: HTTP ${audioResponse.status} - ${audioResponse.statusText}`);
+    const errorText = await audioResponse.text();
+    throw new Error(`Failed to download recording: HTTP ${audioResponse.status} - ${errorText}`);
   }
   
   return await audioResponse.buffer();
@@ -296,6 +311,7 @@ async function sendToN8n(audioBuffer, callData) {
   form.append('start_time', callData.start_time);
   form.append('end_time', callData.end_time);
   form.append('status', callData.status);
+  form.append('type', callData.type || 'Unknown');
   
   // Send to n8n
   const response = await fetch(CONFIG.N8N_WEBHOOK_URL, {
