@@ -42,7 +42,7 @@ function log(level, message, data = null) {
   }
 }
 
-// Token refresh function (optional - for production use)
+// Token refresh function
 async function refreshYeastarToken() {
   if (!CONFIG.TOKEN_REFRESH_ENABLED) return;
   
@@ -67,8 +67,6 @@ async function refreshYeastarToken() {
     CONFIG.YEASTAR_API_TOKEN = data.access_token;
     
     log('success', 'Yeastar API token refreshed successfully');
-    
-    // Schedule next refresh (25 minutes - tokens expire in 30)
     setTimeout(refreshYeastarToken, 25 * 60 * 1000);
     
   } catch (error) {
@@ -76,7 +74,6 @@ async function refreshYeastarToken() {
   }
 }
 
-// Start token refresh if enabled
 if (CONFIG.TOKEN_REFRESH_ENABLED) {
   refreshYeastarToken();
 }
@@ -85,12 +82,11 @@ if (CONFIG.TOKEN_REFRESH_ENABLED) {
 // ROUTES
 // ============================================================================
 
-// Health check endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'OK',
     service: 'Yeastar-n8n Bridge Server with OpenAI Transcription',
-    version: '2.0.0',
+    version: '3.0.0',
     timestamp: new Date().toISOString(),
     config: {
       n8n_configured: !!CONFIG.N8N_WEBHOOK_URL,
@@ -102,7 +98,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// Main webhook endpoint - receives calls from Yeastar
 app.post('/yeastar-webhook', async (req, res) => {
   const startTime = Date.now();
   
@@ -110,11 +105,21 @@ app.post('/yeastar-webhook', async (req, res) => {
     log('info', '📞 Received webhook from Yeastar');
     log('debug', 'Webhook payload', req.body);
     
-    // Extract call data from webhook
     const callData = extractCallData(req.body);
     
+    log('debug', 'Extracted call data', {
+      call_id: callData.call_id,
+      hasRecording: callData.hasRecording,
+      recording_filename: callData.recording_filename,
+      recording_url: callData.recording_url ? 'present' : 'null'
+    });
+    
     if (!callData.hasRecording) {
-      log('warning', 'No recording available for this call', { call_id: callData.call_id });
+      log('warning', 'No recording available for this call', { 
+        call_id: callData.call_id,
+        status: callData.status,
+        call_type: callData.call_type
+      });
       return res.json({ 
         success: true, 
         message: 'Call received but no recording to process',
@@ -122,20 +127,20 @@ app.post('/yeastar-webhook', async (req, res) => {
       });
     }
     
-    // Download recording from Yeastar
-    log('info', `📥 Downloading recording for call: ${callData.call_id}`);
+    log('info', `📥 Downloading recording for call: ${callData.call_id}`, {
+      filename: callData.recording_filename
+    });
+    
     const audioBuffer = await downloadRecording(callData);
-    log('success', `Audio downloaded: ${audioBuffer.length} bytes`);
+    log('success', `Audio downloaded: ${(audioBuffer.length / 1024 / 1024).toFixed(2)} MB`);
     
-    // Transcribe audio with OpenAI Whisper
-    log('info', '🎤 Transcribing audio...');
+    log('info', '🎤 Transcribing audio with OpenAI Whisper...');
     const transcription = await transcribeAudio(audioBuffer, callData);
-    log('success', `Transcription completed: "${transcription.text?.substring(0, 50)}..."`);
+    log('success', `Transcription completed: ${transcription.text?.length || 0} characters`);
     
-    // Send transcription to n8n
     log('info', `📤 Sending transcription to n8n`);
     const n8nResult = await sendToN8n(transcription, callData);
-    log('success', 'Successfully sent to n8n', n8nResult);
+    log('success', 'Successfully sent to n8n');
     
     const processingTime = Date.now() - startTime;
     
@@ -162,7 +167,6 @@ app.post('/yeastar-webhook', async (req, res) => {
   }
 });
 
-// Test endpoint
 app.post('/test', (req, res) => {
   log('info', '🧪 Test endpoint called');
   res.json({
@@ -173,47 +177,23 @@ app.post('/test', (req, res) => {
   });
 });
 
-// Manual trigger endpoint (for testing with file upload)
-app.post('/manual-trigger', async (req, res) => {
-  try {
-    log('info', '🔧 Manual trigger called');
-    
-    // You can use this endpoint to manually upload audio files for testing
-    const { recording_url, call_id } = req.body;
-    
-    if (!recording_url) {
-      return res.status(400).json({ error: 'recording_url is required' });
-    }
-    
-    const callData = {
-      call_id: call_id || 'manual_test',
-      recording_url: recording_url,
-      hasRecording: true
-    };
-    
-    const audioBuffer = await downloadRecording(callData);
-    const result = await sendToN8n(audioBuffer, callData);
-    
-    res.json({
-      success: true,
-      result: result
-    });
-    
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
 function extractCallData(webhookPayload) {
-  // Yeastar webhook payload structure varies by event type
-  // Adjust these fields based on your actual webhook data
+  // Extract recording filename
+  const recordingFileName = webhookPayload.recording || 
+                           webhookPayload.recordingfile || 
+                           null;
+  
+  // Build full recording URL if filename exists
+  let recordingUrl = webhookPayload.recording_url || null;
+  
+  // If no direct URL but we have a filename, construct the API URL
+  if (!recordingUrl && recordingFileName && CONFIG.YEASTAR_API_TOKEN) {
+    recordingUrl = `${CONFIG.YEASTAR_BASE_URL}/openapi/v1.0/recording/download?filename=${encodeURIComponent(recordingFileName)}&access_token=${CONFIG.YEASTAR_API_TOKEN}`;
+  }
   
   return {
     call_id: webhookPayload.call_id || 
@@ -221,29 +201,35 @@ function extractCallData(webhookPayload) {
              webhookPayload.uniqueid || 
              'unknown',
     
-    recording_url: webhookPayload.recording_url || 
-                   webhookPayload.recordingfile || 
-                   null,
+    recording_url: recordingUrl,
     
     recording_id: webhookPayload.recording_id || 
                   webhookPayload.recordingid || 
                   null,
     
-    duration: webhookPayload.duration || 
+    recording_filename: recordingFileName,
+    
+    duration: webhookPayload.call_duration || 
+              webhookPayload.duration || 
               webhookPayload.billsec || 
               '0',
     
-    caller_number: webhookPayload.caller_number || 
+    talk_duration: webhookPayload.talk_duration || '0',
+    
+    caller_number: webhookPayload.call_from || 
+                   webhookPayload.caller_number || 
                    webhookPayload.src || 
                    webhookPayload.from || 
                    '',
     
-    callee_number: webhookPayload.callee_number || 
+    callee_number: webhookPayload.call_to || 
+                   webhookPayload.callee_number || 
                    webhookPayload.dst || 
                    webhookPayload.to || 
                    '',
     
-    start_time: webhookPayload.start_time || 
+    start_time: webhookPayload.time_start || 
+                webhookPayload.start_time || 
                 webhookPayload.calldate || 
                 new Date().toISOString(),
     
@@ -254,34 +240,66 @@ function extractCallData(webhookPayload) {
             webhookPayload.disposition || 
             'ANSWERED',
     
-    hasRecording: !!(webhookPayload.recording_url || webhookPayload.recording_id)
+    call_type: webhookPayload.type || 'Unknown',
+    
+    trunk_name: webhookPayload.dst_trunk_name || 
+                webhookPayload.src_trunk_name || '',
+    
+    // ✅ FIX: Check for recording in multiple ways
+    hasRecording: !!(
+      webhookPayload.recording_url || 
+      webhookPayload.recording_id || 
+      webhookPayload.recording ||        // Most common!
+      webhookPayload.recordingfile
+    )
   };
 }
 
 async function downloadRecording(callData) {
   let audioResponse;
   
-  // Method 1: Direct URL (if provided by Yeastar)
+  // Method 1: Direct URL
   if (callData.recording_url) {
-    log('debug', 'Using direct recording URL');
+    log('debug', 'Downloading via URL', { 
+      method: 'Direct URL',
+      url: callData.recording_url.substring(0, 100) + '...'
+    });
+    
     audioResponse = await fetch(callData.recording_url);
   }
-  // Method 2: Via Yeastar API
+  // Method 2: Via API with recording_id
   else if (callData.recording_id && CONFIG.YEASTAR_API_TOKEN) {
-    log('debug', 'Using Yeastar API to download recording');
+    log('debug', 'Downloading via API with recording_id');
     
     const apiUrl = `${CONFIG.YEASTAR_BASE_URL}/openapi/v1.0/recording/download?recording_id=${callData.recording_id}&access_token=${CONFIG.YEASTAR_API_TOKEN}`;
     audioResponse = await fetch(apiUrl);
   }
+  // Method 3: Via API with filename
+  else if (callData.recording_filename && CONFIG.YEASTAR_API_TOKEN) {
+    log('debug', 'Downloading via API with filename', { 
+      filename: callData.recording_filename 
+    });
+    
+    const apiUrl = `${CONFIG.YEASTAR_BASE_URL}/openapi/v1.0/recording/download?filename=${encodeURIComponent(callData.recording_filename)}&access_token=${CONFIG.YEASTAR_API_TOKEN}`;
+    audioResponse = await fetch(apiUrl);
+  }
   else {
-    throw new Error('No recording URL or recording ID available');
+    throw new Error('No recording URL, ID, or filename available');
   }
   
   if (!audioResponse.ok) {
-    throw new Error(`Failed to download recording: HTTP ${audioResponse.status} - ${audioResponse.statusText}`);
+    const errorText = await audioResponse.text();
+    throw new Error(`Failed to download recording: HTTP ${audioResponse.status} - ${errorText}`);
   }
   
-  return await audioResponse.buffer();
+  const buffer = await audioResponse.buffer();
+  
+  log('debug', 'Recording downloaded successfully', {
+    size_bytes: buffer.length,
+    size_mb: (buffer.length / 1024 / 1024).toFixed(2)
+  });
+  
+  return buffer;
 }
 
 async function transcribeAudio(audioBuffer, callData) {
@@ -289,12 +307,13 @@ async function transcribeAudio(audioBuffer, callData) {
     throw new Error('OPENAI_API_KEY is not configured');
   }
   
-  log('info', '🎤 Transcribing audio with OpenAI Whisper...');
+  log('info', '🎙️ Starting transcription...', {
+    audio_size: `${(audioBuffer.length / 1024 / 1024).toFixed(2)} MB`,
+    language: CONFIG.TRANSCRIPTION_LANGUAGE
+  });
   
-  // Create form data
   const form = new FormData();
   
-  // Add audio file as stream
   const Readable = require('stream').Readable;
   const stream = new Readable();
   stream.push(audioBuffer);
@@ -310,7 +329,6 @@ async function transcribeAudio(audioBuffer, callData) {
   form.append('language', CONFIG.TRANSCRIPTION_LANGUAGE);
   form.append('response_format', 'json');
   
-  // Send to OpenAI
   const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
     body: form,
@@ -327,7 +345,11 @@ async function transcribeAudio(audioBuffer, callData) {
   
   const result = await response.json();
   
-  log('success', `Transcription completed: ${result.text?.length || 0} characters`);
+  log('success', 'Transcription successful', {
+    text_length: result.text?.length || 0,
+    language: result.language,
+    duration: result.duration
+  });
   
   return result;
 }
@@ -337,24 +359,30 @@ async function sendToN8n(transcription, callData) {
     throw new Error('N8N_WEBHOOK_URL is not configured');
   }
   
-  // Prepare data to send to n8n
   const data = {
     call_id: callData.call_id,
     transcript: transcription.text,
     language: transcription.language,
     duration: transcription.duration || callData.duration,
+    talk_duration: callData.talk_duration,
     caller_number: callData.caller_number,
     callee_number: callData.callee_number,
     start_time: callData.start_time,
     end_time: callData.end_time,
     status: callData.status,
+    call_type: callData.call_type,
+    trunk_name: callData.trunk_name,
     transcription_date: new Date().toISOString(),
-    word_count: transcription.text ? transcription.text.split(' ').length : 0
+    word_count: transcription.text ? transcription.text.split(' ').length : 0,
+    recording_filename: callData.recording_filename
   };
   
-  log('debug', 'Sending transcription to n8n', data);
+  log('debug', 'Sending to n8n', {
+    call_id: data.call_id,
+    transcript_preview: data.transcript?.substring(0, 100) + '...',
+    word_count: data.word_count
+  });
   
-  // Send JSON data to n8n
   const response = await fetch(CONFIG.N8N_WEBHOOK_URL, {
     method: 'POST',
     headers: {
@@ -368,7 +396,6 @@ async function sendToN8n(transcription, callData) {
     throw new Error(`n8n webhook failed: HTTP ${response.status} - ${errorText}`);
   }
   
-  // Try to parse JSON response, fallback to text
   const contentType = response.headers.get('content-type');
   if (contentType && contentType.includes('application/json')) {
     return await response.json();
@@ -381,7 +408,6 @@ async function sendToN8n(transcription, callData) {
 // ERROR HANDLING
 // ============================================================================
 
-// Handle 404
 app.use((req, res) => {
   res.status(404).json({
     error: 'Not Found',
@@ -389,13 +415,11 @@ app.use((req, res) => {
     available_endpoints: [
       'GET /',
       'POST /yeastar-webhook',
-      'POST /test',
-      'POST /manual-trigger'
+      'POST /test'
     ]
   });
 });
 
-// Global error handler
 app.use((err, req, res, next) => {
   log('error', 'Unhandled error', {
     error: err.message,
@@ -414,24 +438,22 @@ app.use((err, req, res, next) => {
 // ============================================================================
 
 const server = app.listen(CONFIG.PORT, '0.0.0.0', () => {
-  console.log('\n' + '='.repeat(60));
-  log('success', `🚀 Yeastar-n8n Bridge Server Started`);
-  console.log('='.repeat(60));
+  console.log('\n' + '='.repeat(70));
+  log('success', '🚀 Yeastar-n8n Bridge Server Started (v3.0)');
+  console.log('='.repeat(70));
   log('info', `📡 Port: ${CONFIG.PORT}`);
-  log('info', `🔗 Webhook URL: http://localhost:${CONFIG.PORT}/yeastar-webhook`);
-  log('info', `🔗 Test URL: http://localhost:${CONFIG.PORT}/test`);
-  log('info', `🔗 Health Check: http://localhost:${CONFIG.PORT}/`);
-  console.log('='.repeat(60));
-  log('info', `✅ n8n Webhook: ${CONFIG.N8N_WEBHOOK_URL || 'NOT CONFIGURED'}`);
-  log('info', `✅ Yeastar Base URL: ${CONFIG.YEASTAR_BASE_URL}`);
-  log('info', `✅ Yeastar API Token: ${CONFIG.YEASTAR_API_TOKEN ? 'CONFIGURED' : 'NOT CONFIGURED'}`);
-  log('info', `✅ OpenAI API Key: ${CONFIG.OPENAI_API_KEY ? 'CONFIGURED' : 'NOT CONFIGURED'}`);
-  log('info', `✅ Transcription Language: ${CONFIG.TRANSCRIPTION_LANGUAGE}`);
-  log('info', `✅ Token Auto-Refresh: ${CONFIG.TOKEN_REFRESH_ENABLED ? 'ENABLED' : 'DISABLED'}`);
-  console.log('='.repeat(60) + '\n');
+  log('info', `🔗 Webhook: http://localhost:${CONFIG.PORT}/yeastar-webhook`);
+  log('info', `🔗 Health: http://localhost:${CONFIG.PORT}/`);
+  console.log('='.repeat(70));
+  log('info', `✅ n8n: ${CONFIG.N8N_WEBHOOK_URL || '⚠️ NOT CONFIGURED'}`);
+  log('info', `✅ Yeastar: ${CONFIG.YEASTAR_BASE_URL}`);
+  log('info', `✅ API Token: ${CONFIG.YEASTAR_API_TOKEN ? '✅ CONFIGURED' : '⚠️ NOT CONFIGURED'}`);
+  log('info', `✅ OpenAI: ${CONFIG.OPENAI_API_KEY ? '✅ CONFIGURED' : '⚠️ NOT CONFIGURED'}`);
+  log('info', `✅ Language: ${CONFIG.TRANSCRIPTION_LANGUAGE}`);
+  log('info', `✅ Auto-Refresh: ${CONFIG.TOKEN_REFRESH_ENABLED ? 'ENABLED' : 'DISABLED'}`);
+  console.log('='.repeat(70) + '\n');
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   log('info', 'SIGTERM received, shutting down gracefully...');
   server.close(() => {
